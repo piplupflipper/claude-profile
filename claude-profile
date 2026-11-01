@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# Claude Code の複数アカウントで ~/.claude の設定を共有する。
+#
+# アカウントごとに ~/.claude-<名前> を作り、CLAUDE_CONFIG_DIR で指して起動する。
+# ~/.claude-<名前> に実体を置くのは、アカウントに紐づくものだけ:
+#   .credentials.json (/login で作られる)、.claude.json (oauthAccount を含む)、
+#   組織から配られる設定 (remote-settings.json, policy-limits.json)、実行中の状態 (sessions/, cache/ など)。
+# SHARED に挙げたものは ~/.claude への symlink にする。projects/ を共有するので、
+# 別のアカウントで `claude --resume` して会話を続けられる。
+# .claude.json は oauthAccount まで共有されるので symlink にせず、~/.claude.json の mcpServers だけを写す。
+#
+# 使い方:
+#   claude-profile init sub              # ~/.claude-sub を作る (冪等)。その後 run して /login する
+#   claude-profile init sub --dry-run
+#   claude-profile run sub [claude の引数...]
+#   claude-profile [claude の引数...] run sub [claude の引数...]   # 前に置いた引数も claude へ渡す
+#   claude-profile list
+
+set -euo pipefail
+
+MAIN_DIR="$HOME/.claude"
+MAIN_JSON="$HOME/.claude.json"
+
+# ~/.claude から共有するもの。~/.claude に実在するものだけを張る
+SHARED=(
+    CLAUDE.md
+    settings.json
+    settings.local.json
+    skills
+    agents
+    commands
+    hooks
+    rules
+    output-styles
+    plugins
+    projects
+    plans
+    todos
+    history.jsonl
+    file-history
+)
+
+usage() {
+    cat <<'EOF'
+Usage: claude-profile init <name> [--dry-run]
+       claude-profile [claude args...] run <name> [claude args...]
+       claude-profile list
+
+Share ~/.claude across multiple Claude Code accounts. Each account gets
+~/.claude-<name> holding only its own credentials and .claude.json; shared
+config (CLAUDE.md, settings.json, skills, plugins, projects, ...) is symlinked
+back to ~/.claude.
+
+  init   create or repair ~/.claude-<name> and copy mcpServers from ~/.claude.json
+  run    exec claude with CLAUDE_CONFIG_DIR=~/.claude-<name>; claude args may
+         go before the subcommand too, so a fixed option set can be typed once
+         and only <name> changes (e.g. --dangerously-skip-permissions run sub)
+  list   show profiles and the account each is logged in as
+EOF
+}
+
+die() { echo "claude-profile: $*" >&2; exit 1; }
+
+profile_dir() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "名前は英数字と - _ だけ: '$name'"
+    echo "$HOME/.claude-$name"
+}
+
+DRY_RUN=0
+run() {
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] $*"
+    else
+        "$@"
+    fi
+}
+
+cmd_init() {
+    local name="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run) DRY_RUN=1 ;;
+            -*) die "不明なオプション: $arg" ;;
+            *) [ -z "$name" ] || die "名前は 1 つだけ"; name="$arg" ;;
+        esac
+    done
+    [ -n "$name" ] || die "名前を指定する (例: claude-profile init sub)"
+    [ -d "$MAIN_DIR" ] || die "$MAIN_DIR がない"
+    local dir
+    dir="$(profile_dir "$name")"
+
+    run mkdir -p "$dir"
+    local item src dst
+    for item in "${SHARED[@]}"; do
+        src="$MAIN_DIR/$item"
+        dst="$dir/$item"
+        [ -e "$src" ] || continue
+        if [ -L "$dst" ]; then
+            if [ "$(readlink "$dst")" = "$src" ]; then
+                continue
+            fi
+            echo "張り直し: $dst -> $src (旧: $(readlink "$dst"))"
+            run ln -sfn "$src" "$dst"
+        elif [ -e "$dst" ]; then
+            # このプロファイルで作られた実体は消さない。共有したければ手で退避してから init し直す
+            echo "警告: $dst は実体なので symlink にしない" >&2
+        else
+            echo "symlink: $dst -> $src"
+            run ln -s "$src" "$dst"
+        fi
+    done
+
+    sync_mcp "$dir"
+    if [ ! -f "$dir/.credentials.json" ]; then
+        echo "次に: claude-profile run $name を起動して /login する"
+    fi
+}
+
+# ~/.claude.json の mcpServers を <dir>/.claude.json へ写す。同じ名前のサーバーは ~/.claude.json 側で上書きする
+sync_mcp() {
+    local dir="$1"
+    [ -f "$MAIN_JSON" ] || { echo "$MAIN_JSON がないので mcpServers は写さない"; return; }
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] $MAIN_JSON の mcpServers を $dir/.claude.json へ写す"
+        return
+    fi
+    python3 - "$MAIN_JSON" "$dir/.claude.json" <<'PY'
+import json, os, sys
+src, dst = sys.argv[1], sys.argv[2]
+servers = json.load(open(src)).get("mcpServers") or {}
+data = json.load(open(dst)) if os.path.exists(dst) else {}
+data.setdefault("mcpServers", {}).update(servers)
+tmp = dst + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+os.chmod(tmp, 0o600)
+os.replace(tmp, dst)
+print(f"mcpServers を写した: {', '.join(servers) or '(なし)'}")
+PY
+}
+
+# サブコマンドより前に置かれた claude の引数。run のときだけ使う
+PRE_ARGS=()
+
+cmd_run() {
+    [ $# -ge 1 ] || die "名前を指定する (例: claude-profile run sub)"
+    local dir
+    dir="$(profile_dir "$1")"
+    shift
+    [ -d "$dir" ] || die "$dir がない (先に claude-profile init で作る)"
+    # プラグインの MCP サーバーは npx などで起動するので、mise を activate しないシェル (bash 等) から
+    # 起動しても解決できるよう shims を PATH に足す。失敗は mcp-needs-auth-cache.json に残り、しばらく再接続されない
+    local shims="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+    if [ -d "$shims" ] && [[ ":$PATH:" != *":$shims:"* ]]; then
+        PATH="$shims:$PATH"
+    fi
+    # 空配列の "${PRE_ARGS[@]}" は macOS の bash 3.2 だと set -u で落ちるので + で包む
+    CLAUDE_CONFIG_DIR="$dir" exec claude ${PRE_ARGS[@]+"${PRE_ARGS[@]}"} "$@"
+}
+
+cmd_list() {
+    local dir email
+    for dir in "$MAIN_DIR" "$HOME"/.claude-*; do
+        [ -d "$dir" ] || continue
+        if [ "$dir" = "$MAIN_DIR" ]; then
+            email="$(account_email "$MAIN_JSON")"
+            printf '%-24s %s\n' "(main) ~/.claude" "$email"
+        else
+            email="$(account_email "$dir/.claude.json")"
+            printf '%-24s %s\n' "${dir#"$HOME"/.claude-}" "$email"
+        fi
+    done
+}
+
+account_email() {
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("oauthAccount") or {}).get("emailAddress") or "(未ログイン)")
+except (OSError, ValueError):
+    print("(未ログイン)")
+PY
+}
+
+# 最初に現れたサブコマンド名までを claude の引数として取り分ける。
+# `--model opus run sub` のように値を取るオプションもあるので、- 始まりかどうかでは区切らない
+while [ $# -gt 0 ]; do
+    case "$1" in
+        init | run | list) break ;;
+        -h | --help) [ ${#PRE_ARGS[@]} -eq 0 ] && { usage; exit 0; } ;;
+    esac
+    PRE_ARGS+=("$1")
+    shift
+done
+
+no_pre_args() {
+    [ ${#PRE_ARGS[@]} -eq 0 ] || die "$1 の前に引数は置けない: ${PRE_ARGS[*]}"
+}
+
+case "${1:-}" in
+    init) no_pre_args init; shift; cmd_init "$@" ;;
+    run) shift; cmd_run "$@" ;;
+    list) no_pre_args list; shift; cmd_list ;;
+    "")
+        if [ ${#PRE_ARGS[@]} -eq 0 ]; then usage; else usage >&2; exit 1; fi
+        ;;
+esac
