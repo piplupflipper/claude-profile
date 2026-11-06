@@ -1,37 +1,39 @@
-# claude-profile
+# claude-profile 👯‍♀️💅
 
-Claude Code の複数のアカウントで、`~/.claude` の設定を共有するコマンドです。
+**English** | [日本語](README.ja.md)
 
-アカウントごとに `~/.claude-<名前>` を作り、`CLAUDE_CONFIG_DIR` で指して起動します。
-認証情報のようにアカウントに紐づくものだけをそこへ置き、設定、skills、`projects/` などは `~/.claude` への symlink にします。
-`projects/` を共有するので、別のアカウントで `claude --resume` して会話を続けられます。
+This command lets multiple Claude Code accounts share the same `~/.claude` settings 💖✨
 
-## 必要なもの
+It makes a `~/.claude-<name>` for each account and launches Claude Code with `CLAUDE_CONFIG_DIR` pointing at it.  
+Only account-bound stuff like credentials lives there 🔐, and settings, skills, `projects/` and friends are symlinks to `~/.claude` 🔗  
+Since `projects/` is shared, you can `claude --resume` from a different account and keep the conversation going 💬✨
+
+## 🛍️ Requirements
 
 - bash
-- Claude Code (`claude` コマンド)
+- Claude Code (the `claude` command)
 
-## 導入
+## 📦 Install
 
 ```sh
 install -m 755 claude-profile ~/.local/bin/claude-profile
 ```
 
-## 使い方
+## 🎀 Usage
 
 ```sh
-claude-profile init sub            # ~/.claude-sub を作る。何度実行しても結果は同じ
-claude-profile init sub --dry-run  # 実行内容だけを表示する
-claude-profile run sub             # 起動する。初回は /login する
-claude-profile list                # プロファイルの一覧
+claude-profile init sub            # create ~/.claude-sub. Same result no matter how many times you run it
+claude-profile init sub --dry-run  # only print what it would do
+claude-profile run sub             # launch. Do /login the first time
+claude-profile list                # list profiles
 ```
 
-`run` の前後に書いた引数は `claude` へ渡します。
+Arguments written before or after `run` are passed through to `claude` 🎁
 
 ```sh
 claude-profile --resume run sub
 ```
 
-## ライセンス
+## 📜 License
 
-MIT
+MIT 💖
